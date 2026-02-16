@@ -245,8 +245,14 @@ extern "C" fn become_first_responder(this: &Object, _sel: Sel) -> BOOL {
     let state = unsafe { WindowState::from_view(this) };
     let is_key_window = unsafe {
         let window: id = msg_send![this, window];
-        let is_key_window: BOOL = msg_send![window, isKeyWindow];
-        is_key_window == YES
+        // Guard against null: window can be nil when becomeFirstResponder is
+        // called during viewWillMoveToWindow before the view is attached.
+        if window == nil {
+            false
+        } else {
+            let is_key_window: BOOL = msg_send![window, isKeyWindow];
+            is_key_window == YES
+        }
     };
     if is_key_window {
         state.trigger_event(Event::Window(WindowEvent::Focused));
