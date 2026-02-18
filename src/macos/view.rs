@@ -2,7 +2,7 @@ use std::ffi::c_void;
 
 use cocoa::appkit::{NSEvent, NSFilenamesPboardType, NSView, NSWindow};
 use cocoa::base::{id, nil, BOOL, NO, YES};
-use cocoa::foundation::{NSArray, NSPoint, NSRect, NSSize, NSUInteger};
+use cocoa::foundation::{NSArray, NSPoint, NSRect, NSSize, NSString, NSUInteger};
 
 use objc::{
     class,
@@ -126,7 +126,12 @@ pub(super) unsafe fn create_view(window_options: &WindowOpenOptions) -> id {
 
     let _: id = msg_send![
         view,
-        registerForDraggedTypes: NSArray::arrayWithObjects(nil, &[NSFilenamesPboardType])
+        registerForDraggedTypes: NSArray::arrayWithObjects(nil, &[
+            NSFilenamesPboardType,
+            // Modern pasteboard type (public.file-url) for apps that don't
+            // provide the deprecated NSFilenamesPboardType (e.g. Ableton Live).
+            NSString::alloc(nil).init_str("public.file-url"),
+        ])
     ];
 
     view
@@ -434,8 +439,13 @@ extern "C" fn scroll_wheel(this: &Object, _: Sel, event: id) {
     }));
 }
 
-fn get_drag_position(sender: id) -> Point {
-    let point: NSPoint = unsafe { msg_send![sender, draggingLocation] };
+fn get_drag_position(view: &Object, sender: id) -> Point {
+    let point: NSPoint = unsafe {
+        let window_point: NSPoint = msg_send![sender, draggingLocation];
+        // Convert from window coordinates to view-local coordinates,
+        // matching the coordinate conversion done in mouse_moved.
+        msg_send![view, convertPoint:window_point fromView:nil]
+    };
     Point::new(point.x, point.y)
 }
 
@@ -446,6 +456,31 @@ fn get_drop_data(sender: id) -> DropData {
 
     unsafe {
         let pasteboard: id = msg_send![sender, draggingPasteboard];
+
+        // First, try modern pasteboard API (readObjectsForClasses:options:).
+        // Apps like Ableton Live provide file URLs via the modern
+        // NSPasteboardTypeFileURL / "public.file-url" UTI, which the legacy
+        // NSFilenamesPboardType API cannot read.
+        let nsurl_class: id = class!(NSURL) as *const _ as id;
+        let class_array = NSArray::arrayWithObject(nil, nsurl_class);
+        let options: id = msg_send![class!(NSDictionary), dictionary];
+        let urls: id = msg_send![pasteboard, readObjectsForClasses:class_array options:options];
+
+        if urls != nil && NSArray::count(urls) > 0 {
+            let mut files = vec![];
+            for i in 0..NSArray::count(urls) {
+                let url: id = NSArray::objectAtIndex(urls, i);
+                let path: id = msg_send![url, path];
+                if path != nil {
+                    files.push(from_nsstring(path).into());
+                }
+            }
+            if !files.is_empty() {
+                return DropData::Files(files);
+            }
+        }
+
+        // Fallback: try legacy NSFilenamesPboardType (property list of paths).
         let file_list: id = msg_send![pasteboard, propertyListForType: NSFilenamesPboardType];
 
         if file_list == nil {
@@ -479,7 +514,7 @@ extern "C" fn dragging_entered(this: &Object, _sel: Sel, sender: id) -> NSUInteg
     let drop_data = get_drop_data(sender);
 
     let event = MouseEvent::DragEntered {
-        position: get_drag_position(sender),
+        position: get_drag_position(this, sender),
         modifiers: make_modifiers(modifiers),
         data: drop_data,
     };
@@ -493,7 +528,7 @@ extern "C" fn dragging_updated(this: &Object, _sel: Sel, sender: id) -> NSUInteg
     let drop_data = get_drop_data(sender);
 
     let event = MouseEvent::DragMoved {
-        position: get_drag_position(sender),
+        position: get_drag_position(this, sender),
         modifiers: make_modifiers(modifiers),
         data: drop_data,
     };
@@ -514,7 +549,7 @@ extern "C" fn perform_drag_operation(this: &Object, _sel: Sel, sender: id) -> BO
     let drop_data = get_drop_data(sender);
 
     let event = MouseEvent::DragDropped {
-        position: get_drag_position(sender),
+        position: get_drag_position(this, sender),
         modifiers: make_modifiers(modifiers),
         data: drop_data,
     };
